@@ -326,59 +326,129 @@ class AsyncRPC:
 
 # ==================== ПОЛУЧЕНИЕ ТРАНЗАКЦИЙ ====================
 async def get_transactions(chain: str, address: str, from_block: int, to_block: int) -> List[dict]:
+    """
+    Получить транзакции для указанного адреса в диапазоне блоков.
+
+    Args:
+        chain: Идентификатор сети (ethereum, bsc, tron и т.д.)
+        address: Адрес кошелька для отслеживания
+        from_block: Начальный блок (не включительно)
+        to_block: Конечный блок (включительно)
+
+    Returns:
+        Список транзакций с полями: hash, from, to, value, block, type
+    """
     txs = []
     addr_lower = address.lower()
+    config = RPC_CONFIGS.get(chain, {})
+    chain_type = config.get('type', 'evm')
+
+    logger.debug(f"Поиск транзакций для {address[:10]}... на {chain} (блоки {from_block+1}-{to_block})")
 
     async with AsyncRPC(chain) as rpc:
         for block_num in range(from_block + 1, to_block + 1):
             cached = rpc_cache.blocks.get(f"{chain}_{block_num}")
             block = cached if cached else await rpc.get_block(block_num)
 
-            if not block or 'transactions' not in block:
+            if not block:
+                logger.debug(f"Блок {block_num} на {chain}: не получен")
+                continue
+
+            if 'transactions' not in block:
+                logger.debug(f"Блок {block_num} на {chain}: нет поля transactions")
                 continue
 
             if not cached:
                 rpc_cache.blocks[f"{chain}_{block_num}"] = block
 
-            if chain == 'tron':
+            # Обработка TRON транзакций
+            if chain_type == 'tron':
                 for tx in block.get('transactions', []):
                     if 'raw_data' not in tx:
                         continue
                     for contract in tx['raw_data'].get('contract', []):
                         if contract.get('type') == 'TransferContract':
-                            value = contract['parameter']['value']
-                            tx_from = value.get('owner_address', '').lower()
-                            tx_to = value.get('to_address', '').lower()
+                            param_value = contract.get('parameter', {}).get('value', {})
+                            tx_from = param_value.get('owner_address', '')
+                            tx_to = param_value.get('to_address', '')
 
-                            if tx_from == addr_lower or tx_to == addr_lower:
+                            # Нормализуем адреса для сравнения
+                            tx_from_lower = tx_from.lower() if tx_from else ''
+                            tx_to_lower = tx_to.lower() if tx_to else ''
+
+                            is_outgoing = tx_from_lower == addr_lower
+                            is_incoming = tx_to_lower == addr_lower
+
+                            if is_outgoing or is_incoming:
+                                tx_type = 'out' if is_outgoing else 'in'
+                                amount = param_value.get('amount', 0) / 1_000_000
+
+                                logger.debug(
+                                    f"Найдена {tx_type} транзакция TRON: "
+                                    f"{amount:.6f} TRX, блок {block_num}"
+                                )
+
                                 txs.append({
                                     'hash': tx.get('txID', ''),
-                                    'from': tx_from,
-                                    'to': tx_to,
-                                    'value': value.get('amount', 0) / 1_000_000,
+                                    'from': tx_from_lower,
+                                    'to': tx_to_lower,
+                                    'value': amount,
                                     'block': block_num,
-                                    'type': 'out' if tx_from == addr_lower else 'in'
+                                    'type': tx_type
                                 })
+            # Обработка EVM транзакций
             else:
-                for tx in block['transactions']:
-                    if isinstance(tx, dict):
-                        tx_hash = tx.get('hash', '')
-                        tx_from = tx.get('from', '').lower()
-                        tx_to = tx.get('to', '').lower() if tx.get('to') else ''
+                for tx in block.get('transactions', []):
+                    if not isinstance(tx, dict):
+                        logger.debug(f"Блок {block_num}: транзакция не является dict")
+                        continue
 
-                        if tx_from == addr_lower or tx_to == addr_lower:
-                            value = int(tx.get('value', '0x0'), 16) / 1e18
-                            txs.append({
-                                'hash': tx_hash,
-                                'from': tx_from,
-                                'to': tx_to,
-                                'value': value,
-                                'block': block_num,
-                                'type': 'out' if tx_from == addr_lower else 'in'
-                            })
+                    tx_hash = tx.get('hash', '')
+                    tx_from = tx.get('from', '')
+                    tx_to = tx.get('to')  # может быть None для contract creation
+
+                    # Нормализуем адреса для сравнения
+                    tx_from_lower = tx_from.lower() if tx_from else ''
+                    tx_to_lower = tx_to.lower() if tx_to else ''
+
+                    is_outgoing = tx_from_lower == addr_lower
+                    is_incoming = tx_to_lower == addr_lower
+
+                    if is_outgoing or is_incoming:
+                        tx_type = 'out' if is_outgoing else 'in'
+
+                        try:
+                            value_hex = tx.get('value', '0x0')
+                            value = int(value_hex, 16) / (10 ** config.get('decimals', 18))
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Ошибка парсинга value '{tx.get('value')}': {e}")
+                            value = 0
+
+                        logger.debug(
+                            f"Найдена {tx_type} транзакция EVM ({chain}): "
+                            f"{value:.6f} {config.get('symbol', '?')}, блок {block_num}, "
+                            f"hash={tx_hash[:16]}..."
+                        )
+
+                        txs.append({
+                            'hash': tx_hash,
+                            'from': tx_from_lower,
+                            'to': tx_to_lower,
+                            'value': value,
+                            'block': block_num,
+                            'type': tx_type
+                        })
 
             if block_num % 5 == 0:
                 await asyncio.sleep(0.1)
+
+    if txs:
+        in_count = sum(1 for t in txs if t['type'] == 'in')
+        out_count = sum(1 for t in txs if t['type'] == 'out')
+        logger.info(
+            f"Найдено {len(txs)} транзакций для {address[:10]}... на {chain}: "
+            f"{in_count} входящих, {out_count} исходящих"
+        )
 
     return txs
 
@@ -690,7 +760,8 @@ async def check_transactions():
     """Фоновая задача для проверки транзакций"""
     while True:
         try:
-            logger.info(f"🔍 Проверка {sum(len(w) for w in user_subs.values())} кошельков...")
+            total_wallets = sum(len(w) for w in user_subs.values())
+            logger.info(f"🔍 Проверка {total_wallets} кошельков...")
 
             for chat_id, wallets in list(user_subs.items()):
                 for address, data in list(wallets.items()):
@@ -702,34 +773,66 @@ async def check_transactions():
                             current_block = await rpc.get_block_number()
 
                         if current_block <= last_block:
+                            logger.debug(
+                                f"Кошелек {format_addr(address)} на {chain}: "
+                                f"нет новых блоков (текущий={current_block}, последний={last_block})"
+                            )
                             continue
+
+                        blocks_to_check = current_block - last_block
+                        logger.debug(
+                            f"Кошелек {format_addr(address)} на {chain}: "
+                            f"проверяем {blocks_to_check} блоков ({last_block+1}-{current_block})"
+                        )
 
                         txs = await get_transactions(chain, address, last_block, current_block)
 
-                        if txs:
-                            logger.info(f"Найдено {len(txs)} новых транзакций для {format_addr(address)} на {chain}")
-
+                        # Обновляем last_block и сохраняем
                         data['last_block'] = current_block
                         save_data()
 
+                        if not txs:
+                            continue
+
+                        # Подсчитываем типы транзакций до фильтрации
+                        in_count = sum(1 for tx in txs if tx['type'] == 'in')
+                        out_count = sum(1 for tx in txs if tx['type'] == 'out')
+                        logger.info(
+                            f"Найдено {len(txs)} транзакций для {format_addr(address)} на {chain}: "
+                            f"{in_count} входящих, {out_count} исходящих"
+                        )
+
+                        # Применяем фильтры уведомлений
                         notify_incoming = data.get('notify_incoming', True)
                         notify_outgoing = data.get('notify_outgoing', True)
+
                         filtered_txs = [
                             tx for tx in txs
                             if (tx['type'] == 'in' and notify_incoming) or
                                (tx['type'] == 'out' and notify_outgoing)
                         ]
 
+                        if len(filtered_txs) != len(txs):
+                            logger.debug(
+                                f"После фильтрации: {len(filtered_txs)} из {len(txs)} транзакций "
+                                f"(notify_incoming={notify_incoming}, notify_outgoing={notify_outgoing})"
+                            )
+
+                        # Отправляем уведомления (максимум 5 последних)
                         for tx in filtered_txs[-5:]:
                             msg = format_tx_message(chain, tx, address)
                             try:
                                 await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+                                logger.debug(
+                                    f"Отправлено уведомление о {tx['type']} транзакции "
+                                    f"на {tx['value']:.6f} в чат {chat_id}"
+                                )
                                 await asyncio.sleep(0.5)
                             except Exception as e:
-                                logger.error(f"Ошибка отправки сообщения: {e}")
+                                logger.error(f"Ошибка отправки сообщения в чат {chat_id}: {e}")
 
                     except Exception as e:
-                        logger.error(f"Ошибка проверки {address} на {chain}: {e}")
+                        logger.error(f"Ошибка проверки {format_addr(address)} на {chain}: {e}")
 
                     await asyncio.sleep(1)
 
