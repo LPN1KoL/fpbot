@@ -33,6 +33,7 @@ dp = Dispatcher(storage=storage)
 RPC_CONFIGS = {
     'ethereum': {
         'name': 'Ethereum', 'symbol': 'ETH', 'color': '🔷',
+        'explorer': 'https://etherscan.io/tx/',
         'primary': ['https://eth.llamarpc.com', 'https://rpc.ankr.com/eth'],
         'fallback': [
             'https://cloudflare-eth.com',
